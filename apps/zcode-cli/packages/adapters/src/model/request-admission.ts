@@ -24,6 +24,37 @@ export interface AttemptAdmission {
 const NO_ADMISSION: AttemptAdmission = { release() {} };
 
 /**
+ * Optional server-side hard stop for OpenCode Go. The model adapter calls this
+ * before EVERY network attempt (normal generations, streams, retries, subagents
+ * and sidecars). Do not rely on CLI wrappers or UI session admission alone.
+ *
+ * The Go guard reads the official usage API and requires all three quota
+ * windows to remain above their configured safety reserves. The provider
+ * does not expose Extra Usage state in this endpoint, so it is reported as
+ * unverified rather than incorrectly treated as a quota failure.
+ * This function never exposes credentials or switches to a paid fallback.
+ */
+async function enforceServerGoQuota(model: ModelRequestTarget): Promise<void> {
+  if (String(model.providerId) !== "opencode-go") return;
+  if (typeof process === "undefined" || process.env["ZCODE_GO_WEB_QUOTA_ENFORCEMENT"] !== "1") return;
+  try {
+    const { execFile } = await import("node:child_process");
+    await new Promise<void>((resolve, reject) => {
+      execFile(
+        "/root/bin/zcode-go-guard",
+        ["--project", "ai", "--check"],
+        { timeout: 5000, windowsHide: true, maxBuffer: 8192 },
+        (error) => error ? reject(error) : resolve(),
+      );
+    });
+  } catch {
+    throw new Error(
+      "OpenCode Go model request denied by quota guard: official Go allowance unavailable, rate-limited, or below safety reserve; check /root/bin/zcode-go-usage.",
+    );
+  }
+}
+
+/**
  * 准入端口报告的重试冷却（ms）；端口不实现 `retryCooldownMs`（排队准入、无准入）或报出非正数、非有限值时为 0。
  * 只在重试的退避里读，首次请求不读：主代理（observer）的首次请求照常立刻发出。
  */
@@ -48,6 +79,7 @@ export async function admitAttempt(input: {
   onQueued?: () => Promise<void>;
   onAdmitted?: (queuedMs: number) => Promise<void>;
 }): Promise<AttemptAdmission> {
+  await enforceServerGoQuota(input.model);
   if (input.admission === undefined) return NO_ADMISSION;
   const hasFastPath = typeof input.admission.tryAcquire === "function";
   let ticket = hasFastPath ? input.admission.tryAcquire!({ model: input.model }) : undefined;
